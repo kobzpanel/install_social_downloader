@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =================== Config (can be overridden by env) ===================
+# =================== Config (env overrides allowed) ===================
 APP_DIR="${APP_DIR:-/opt/social-downloader}"
-WANTED_PORT="${PORT:-8080}"                # external host port -> container 8080
+WANTED_PORT="${PORT:-8080}"           # host port -> container 8080
 IMAGE="${IMAGE:-social-downloader:latest}"
 SERVICE="${SERVICE:-social-downloader}"
-DOMAIN="${DOMAIN:-}"                        # set to enable Nginx + HTTPS
-EMAIL="${EMAIL:-}"                          # required when DOMAIN is set
-# ========================================================================
+DOMAIN="${DOMAIN:-}"                  # set to enable Nginx + HTTPS
+EMAIL="${EMAIL:-}"                    # required when DOMAIN is set
+# =====================================================================
 
 ok(){ echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 warn(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
@@ -20,9 +20,7 @@ find_free_port(){
   local start="${1:-8080}"
   local p
   for p in $(seq "$start" $((start+99))); do
-    if ! port_in_use "$p"; then
-      echo "$p"; return 0
-    fi
+    if ! port_in_use "$p"; then echo "$p"; return 0; fi
   done
   return 1
 }
@@ -64,7 +62,7 @@ orjson==3.10.7
 yt-dlp==2025.01.08
 REQ
 
-  # Dockerfile
+  # Dockerfile (FIXED healthcheck uses curl; no heredoc)
   cat > "${APP_DIR}/backend/Dockerfile" <<'DOCK'
 FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
@@ -77,13 +75,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py /app/app.py
 COPY templates /app/templates
 RUN mkdir -p /app/downloads
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD python - <<'PY' || exit 1
-import urllib.request, sys
-try:
-  with urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=3) as r:
-    sys.exit(0 if r.status==200 else 1)
-except: sys.exit(1)
-PY
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini","--"]
 CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8080","--workers","1"]
@@ -203,7 +195,7 @@ async def download_file(filename: str):
     return FileResponse(str(p), filename=filename)
 PY
 
-  # New UI
+  # UI (clean + responsive)
   cat > "${APP_DIR}/backend/templates/index.html" <<'HTML'
 <!doctype html>
 <html lang="en">
@@ -219,7 +211,7 @@ PY
     .logo{width:44px; height:44px; border-radius:12px; background:linear-gradient(135deg,#6ee7b7,#3b82f6); box-shadow:0 10px 30px rgba(59,130,246,.25);}
     h1{font-size:28px; margin:0;}
     .muted{color:#9ca3af; font-size:14px;}
-    .card{background:#0f172a; border:1px solid #1f2937; border-radius:16px; padding:20px; box-shadow:0 10px 30px rgba(0,0,0,.35);}
+    .card{background:#0f172a; border:1px solid #1f2937; border-radius:16px; padding:20px; box-shadow: 0 10px 30px rgba(0,0,0,.35);}
     label{display:block; font-weight:600; margin: 0 0 8px;}
     input[type="text"]{width:100%; padding:14px 12px; border:1px solid #334155; border-radius:12px; background:#0b1220; color:#e5e7eb; outline:none}
     .row{display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-top:10px;}
@@ -371,7 +363,7 @@ COMPOSE
 }
 
 build_and_run(){
-  ok "Building image (this may take a minute)..."
+  ok "Building image..."
   docker compose -f "${APP_DIR}/docker-compose.yml" build --pull
   ok "Starting container..."
   docker compose -f "${APP_DIR}/docker-compose.yml" up -d
@@ -383,7 +375,7 @@ build_and_run(){
     fi
     sleep 2
   done
-  warn "Health check did not confirm in time. You can check logs with:
+  warn "Health check not confirmed yet. You can check logs with:
   docker compose -f ${APP_DIR}/docker-compose.yml logs -f"
 }
 
@@ -453,8 +445,8 @@ NGINX
   if certbot --nginx -d "${DOMAIN}" --redirect -m "${EMAIL}" --agree-tos -n; then
     ok "TLS issued and installed for ${DOMAIN}."
   else
-    warn "Certbot failed; check DNS A record and try again:"
-    echo "  certbot --nginx -d ${DOMAIN} --redirect -m ${EMAIL} --agree-tos -n"
+    warn "Certbot failed; ensure DNS A record points to this server, then rerun:
+  certbot --nginx -d ${DOMAIN} --redirect -m ${EMAIL} --agree-tos -n"
   fi
 }
 
@@ -480,9 +472,9 @@ main(){
   install_docker
   make_app
 
-  # Pick a free host port (avoid systemd fail due to port collision)
+  # Pick a free host port
   if port_in_use "$WANTED_PORT"; then
-    warn "Port ${WANTED_PORT} busy. Searching for a free one..."
+    warn "Port ${WANTED_PORT} is busy. Searching for a free one..."
     HOST_PORT="$(find_free_port "$WANTED_PORT")" || { err "No free port near ${WANTED_PORT}."; exit 1; }
     ok "Using port ${HOST_PORT}."
   else
@@ -490,9 +482,9 @@ main(){
   fi
 
   write_compose "$HOST_PORT"
-  build_and_run          # build & start now to surface errors clearly
-  make_service           # then create service
-  setup_nginx_tls        # HTTP first, then cert
+  build_and_run
+  make_service
+  setup_nginx_tls
   summary
 }
 
