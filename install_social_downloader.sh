@@ -1,21 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ===================== Config (env overrides allowed) =====================
+# =================== Config (can be overridden by env) ===================
 APP_DIR="${APP_DIR:-/opt/social-downloader}"
-PORT="${PORT:-8080}"                 # external port -> container 8080
+WANTED_PORT="${PORT:-8080}"                # external host port -> container 8080
 IMAGE="${IMAGE:-social-downloader:latest}"
 SERVICE="${SERVICE:-social-downloader}"
-DOMAIN="${DOMAIN:-}"                 # set to enable Nginx + HTTPS
-EMAIL="${EMAIL:-}"                   # required when DOMAIN is set
-# ==========================================================================
+DOMAIN="${DOMAIN:-}"                        # set to enable Nginx + HTTPS
+EMAIL="${EMAIL:-}"                          # required when DOMAIN is set
+# ========================================================================
 
 ok(){ echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 warn(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err(){ echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
 need_root(){ [[ "$(id -u)" -eq 0 ]] || { err "Run as root (sudo)."; exit 1; } }
 
-install_docker() {
+port_in_use(){ ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":(^|)${1}\$"; }
+find_free_port(){
+  local start="${1:-8080}"
+  local p
+  for p in $(seq "$start" $((start+99))); do
+    if ! port_in_use "$p"; then
+      echo "$p"; return 0
+    fi
+  done
+  return 1
+}
+
+install_docker(){
   if ! command -v docker >/dev/null 2>&1; then
     ok "Installing Docker Engine..."
     apt-get update -y
@@ -39,11 +51,11 @@ install_docker() {
   fi
 }
 
-make_app() {
+make_app(){
   ok "Creating app at ${APP_DIR}..."
   mkdir -p "${APP_DIR}/backend/templates" "${APP_DIR}/downloads"
 
-  # ---------------- requirements ----------------
+  # requirements
   cat > "${APP_DIR}/backend/requirements.txt" <<'REQ'
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
@@ -52,24 +64,19 @@ orjson==3.10.7
 yt-dlp==2025.01.08
 REQ
 
-  # ---------------- Dockerfile ----------------
+  # Dockerfile
   cat > "${APP_DIR}/backend/Dockerfile" <<'DOCK'
 FROM python:3.11-slim
-
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates tzdata tini curl && \
     rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
-
 COPY app.py /app/app.py
 COPY templates /app/templates
 RUN mkdir -p /app/downloads
-
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD python - <<'PY' || exit 1
 import urllib.request, sys
 try:
@@ -77,17 +84,14 @@ try:
     sys.exit(0 if r.status==200 else 1)
 except: sys.exit(1)
 PY
-
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini","--"]
 CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8080","--workers","1"]
 DOCK
 
-  # ---------------- FastAPI backend ----------------
+  # Backend
   cat > "${APP_DIR}/backend/app.py" <<'PY'
-import re
-import uuid
-import asyncio
+import re, uuid, asyncio
 from pathlib import Path
 from typing import Dict, Optional
 from fastapi import FastAPI, Request, HTTPException, Form, BackgroundTasks
@@ -101,7 +105,6 @@ app = FastAPI(title="Social Video Downloader")
 templates = Jinja2Templates(directory="templates")
 
 JOBS: Dict[str, dict] = {}  # job_id -> {status, progress, file, error, url, audio_only, title}
-
 PROG_RE = re.compile(r"\[download\]\s+(\d{1,3}(?:\.\d+)?)%")
 
 def latest_file(dirpath: Path) -> Optional[Path]:
@@ -113,23 +116,16 @@ async def run_yt_dlp(job_id: str, url: str, audio_only: bool):
     try:
         out_tpl = str(DOWNLOAD_DIR / "%(title).80s-%(id)s.%(ext)s")
         cmd = ["yt-dlp","-o", out_tpl, "--restrict-filenames", "--newline", "--no-warnings", url]
-        if audio_only:
-            cmd += ["-x","--audio-format","mp3","--audio-quality","0"]
-        else:
-            cmd += ["-f","bv*+ba/b"]
+        if audio_only: cmd += ["-x","--audio-format","mp3","--audio-quality","0"]
+        else: cmd += ["-f","bv*+ba/b"]
 
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(DOWNLOAD_DIR)
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=str(DOWNLOAD_DIR)
         )
-
         assert proc.stdout
         async for raw in proc.stdout:
             line = raw.decode(errors="ignore").strip()
-            if not line: 
-                continue
+            if not line: continue
             m = PROG_RE.search(line)
             if m:
                 pct = float(m.group(1))
@@ -161,9 +157,7 @@ async def health():
     return JSONResponse({"ok": True})
 
 @app.post("/api/download")
-async def api_download(background_tasks: BackgroundTasks,
-                       url: str = Form(...),
-                       audio_only: bool = Form(False)):
+async def api_download(background_tasks: BackgroundTasks, url: str = Form(...), audio_only: bool = Form(False)):
     if not url.startswith(("http://","https://")):
         raise HTTPException(status_code=400, detail="Invalid URL")
     job_id = str(uuid.uuid4())
@@ -174,14 +168,12 @@ async def api_download(background_tasks: BackgroundTasks,
 @app.get("/api/status/{job_id}")
 async def api_status(job_id: str):
     data = JOBS.get(job_id)
-    if not data:
-        raise HTTPException(status_code=404, detail="Job not found.")
+    if not data: raise HTTPException(status_code=404, detail="Job not found.")
     return JSONResponse(data)
 
 @app.get("/api/stream/{job_id}")
 async def api_stream(job_id: str):
-    if job_id not in JOBS:
-        raise HTTPException(status_code=404, detail="Job not found.")
+    if job_id not in JOBS: raise HTTPException(status_code=404, detail="Job not found.")
     async def gen():
         last = None
         while True:
@@ -207,12 +199,11 @@ async def history():
 @app.get("/d/{filename}")
 async def download_file(filename: str):
     p = DOWNLOAD_DIR / filename
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
+    if not p.exists(): raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(str(p), filename=filename)
 PY
 
-  # ---------------- New UI (clean + responsive) ----------------
+  # New UI
   cat > "${APP_DIR}/backend/templates/index.html" <<'HTML'
 <!doctype html>
 <html lang="en">
@@ -228,7 +219,7 @@ PY
     .logo{width:44px; height:44px; border-radius:12px; background:linear-gradient(135deg,#6ee7b7,#3b82f6); box-shadow:0 10px 30px rgba(59,130,246,.25);}
     h1{font-size:28px; margin:0;}
     .muted{color:#9ca3af; font-size:14px;}
-    .card{background:#0f172a; border:1px solid #1f2937; border-radius:16px; padding:20px; box-shadow: 0 10px 30px rgba(0,0,0,.35);}
+    .card{background:#0f172a; border:1px solid #1f2937; border-radius:16px; padding:20px; box-shadow:0 10px 30px rgba(0,0,0,.35);}
     label{display:block; font-weight:600; margin: 0 0 8px;}
     input[type="text"]{width:100%; padding:14px 12px; border:1px solid #334155; border-radius:12px; background:#0b1220; color:#e5e7eb; outline:none}
     .row{display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-top:10px;}
@@ -349,7 +340,11 @@ f.addEventListener('submit', async (e)=>{
 </html>
 HTML
 
-  # ---------------- docker-compose ----------------
+  ok "App files ready."
+}
+
+write_compose(){
+  local PORT="$1"
   cat > "${APP_DIR}/docker-compose.yml" <<COMPOSE
 services:
   web:
@@ -373,11 +368,26 @@ services:
     cap_drop:
       - ALL
 COMPOSE
-
-  ok "App files ready."
 }
 
-make_service() {
+build_and_run(){
+  ok "Building image (this may take a minute)..."
+  docker compose -f "${APP_DIR}/docker-compose.yml" build --pull
+  ok "Starting container..."
+  docker compose -f "${APP_DIR}/docker-compose.yml" up -d
+  ok "Checking health..."
+  for i in $(seq 1 30); do
+    if curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" >/dev/null 2>&1; then
+      ok "App healthy."
+      return 0
+    fi
+    sleep 2
+  done
+  warn "Health check did not confirm in time. You can check logs with:
+  docker compose -f ${APP_DIR}/docker-compose.yml logs -f"
+}
+
+make_service(){
   ok "Adding systemd unit..."
   cat > "/etc/systemd/system/${SERVICE}.service" <<UNIT
 [Unit]
@@ -397,18 +407,13 @@ TimeoutStartSec=0
 [Install]
 WantedBy=multi-user.target
 UNIT
-
   systemctl daemon-reload
   systemctl enable --now "${SERVICE}.service" || true
 }
 
-setup_nginx_tls() {
-  if [[ -z "$DOMAIN" ]]; then
-    warn "DOMAIN not set — skipping Nginx + TLS."
-    return
-  fi
-  if [[ -z "$EMAIL" ]]; then
-    warn "EMAIL not set — skipping Nginx + TLS."
+setup_nginx_tls(){
+  if [[ -z "$DOMAIN" || -z "$EMAIL" ]]; then
+    warn "DOMAIN or EMAIL not set — skipping Nginx + TLS."
     return
   fi
   ok "Installing Nginx + Certbot for ${DOMAIN} ..."
@@ -417,26 +422,17 @@ setup_nginx_tls() {
   ufw allow 'Nginx Full' >/dev/null 2>&1 || true
   ufw allow OpenSSH >/dev/null 2>&1 || true
 
+  # HTTP-only first (so nginx -t passes before cert exists)
   tee /etc/nginx/sites-available/${DOMAIN} >/dev/null <<NGINX
 server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
+
     location /.well-known/acme-challenge/ { root /var/www/html; }
-    location / { return 301 https://\$host\$request_uri; }
-}
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${DOMAIN};
-
-    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-
-    client_max_body_size 512m;
 
     location / {
-        proxy_pass http://127.0.0.1:${PORT};
+        proxy_pass http://127.0.0.1:${HOST_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -452,16 +448,21 @@ NGINX
 
   ln -sf /etc/nginx/sites-available/${DOMAIN} /etc/nginx/sites-enabled/${DOMAIN}
   nginx -t && systemctl reload nginx
-  certbot --nginx -d "${DOMAIN}" --redirect -m "${EMAIL}" --agree-tos -n || {
-    warn "Certbot failed; check DNS A record and try again."
-  }
+
+  # Now issue cert and let certbot inject HTTPS + redirect
+  if certbot --nginx -d "${DOMAIN}" --redirect -m "${EMAIL}" --agree-tos -n; then
+    ok "TLS issued and installed for ${DOMAIN}."
+  else
+    warn "Certbot failed; check DNS A record and try again:"
+    echo "  certbot --nginx -d ${DOMAIN} --redirect -m ${EMAIL} --agree-tos -n"
+  fi
 }
 
-summary() {
+summary(){
   echo
   ok "All set."
-  local IP="$(hostname -I | awk '{print $1}')"
-  echo "Open:   http://${IP}:${PORT}/"
+  local ip="$(hostname -I | awk '{print $1}')"
+  echo "Open:   http://${ip}:${HOST_PORT}/"
   [[ -n "$DOMAIN" ]] && echo "Domain: https://${DOMAIN}/"
   echo "Path:   ${APP_DIR}"
   echo "DL dir: ${APP_DIR}/downloads"
@@ -470,14 +471,28 @@ summary() {
   echo "  systemctl status ${SERVICE}"
   echo "  systemctl restart ${SERVICE}"
   echo "  docker compose -f ${APP_DIR}/docker-compose.yml logs -f"
+  echo
+  echo "Note: download only content you have rights to."
 }
 
-main() {
+main(){
   need_root
   install_docker
   make_app
-  make_service
-  setup_nginx_tls
+
+  # Pick a free host port (avoid systemd fail due to port collision)
+  if port_in_use "$WANTED_PORT"; then
+    warn "Port ${WANTED_PORT} busy. Searching for a free one..."
+    HOST_PORT="$(find_free_port "$WANTED_PORT")" || { err "No free port near ${WANTED_PORT}."; exit 1; }
+    ok "Using port ${HOST_PORT}."
+  else
+    HOST_PORT="$WANTED_PORT"
+  fi
+
+  write_compose "$HOST_PORT"
+  build_and_run          # build & start now to surface errors clearly
+  make_service           # then create service
+  setup_nginx_tls        # HTTP first, then cert
   summary
 }
 
