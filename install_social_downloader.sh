@@ -3,11 +3,11 @@ set -euo pipefail
 
 # =================== Config (env overrides allowed) ===================
 APP_DIR="${APP_DIR:-/opt/social-downloader}"
-WANTED_PORT="${PORT:-8080}"           # container listens on 8080; this is the host port we publish
+WANTED_PORT="${PORT:-8080}"           # host port -> container 8080
 IMAGE="${IMAGE:-social-downloader:latest}"
 SERVICE="${SERVICE:-social-downloader}"
-DOMAIN="${DOMAIN:-}"                  # to enable HTTPS
-EMAIL="${EMAIL:-}"                    # certbot email
+DOMAIN="${DOMAIN:-}"                  # set both DOMAIN and EMAIL for HTTPS
+EMAIL="${EMAIL:-}"
 # =====================================================================
 
 ok(){ echo -e "\033[1;32m[ OK ]\033[0m $*"; }
@@ -21,32 +21,37 @@ find_free_port(){ local s="${1:-8080}"; for p in $(seq "$s" $((s+99))); do port_
 detect_os(){
   . /etc/os-release
   OS_ID="${ID}"; OS_CODENAME="${VERSION_CODENAME:-}"
-  case "$OS_ID" in ubuntu|debian) ;; *) warn "Script targets Ubuntu/Debian; detected ${OS_ID}. Continuing...";; esac
+  case "$OS_ID" in ubuntu|debian) ;; *) warn "Non Ubuntu/Debian detected (${OS_ID}). Continuing...";; esac
+}
+
+preclean(){
+  systemctl disable --now "${SERVICE}.service" >/dev/null 2>&1 || true
+  docker rm -f "${SERVICE}" >/dev/null 2>&1 || true
 }
 
 install_docker(){
   if ! command -v docker >/dev/null 2>&1; then
-    ok "Installing Docker Engine..."
+    ok "Installing Docker..."
     apt-get update -y
     apt-get install -y ca-certificates curl gnupg lsb-release
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/${OS_ID}/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_ID} ${OS_CODENAME} stable" \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${OS_CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
     apt-get update -y
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     systemctl enable --now docker
   else
-    ok "Docker already installed."
+    ok "Docker already present."
   fi
-  command -v docker >/dev/null || { err "Docker not found after install."; exit 1; }
 }
 
-make_app(){
-  ok "Creating app at ${APP_DIR}..."
+write_app(){
+  ok "Writing app to ${APP_DIR}..."
   mkdir -p "${APP_DIR}/backend/templates" "${APP_DIR}/downloads"
 
+  # Dependencies (yt-dlp floats to latest for site fixes)
   cat > "${APP_DIR}/backend/requirements.txt" <<'REQ'
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
@@ -54,7 +59,7 @@ jinja2==3.1.4
 yt-dlp
 REQ
 
-  # Hardened Dockerfile (pip upgrade + build tools; curl healthcheck)
+  # Hardened Dockerfile
   cat > "${APP_DIR}/backend/Dockerfile" <<'DOCK'
 FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -74,7 +79,7 @@ ENTRYPOINT ["/usr/bin/tini","--"]
 CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8080","--workers","1"]
 DOCK
 
-  # FastAPI backend (SSE JSON, progress, history)
+  # Backend (syntax fixed, SSE JSON, progress, history)
   cat > "${APP_DIR}/backend/app.py" <<'PY'
 import re, uuid, asyncio, json
 from pathlib import Path
@@ -99,7 +104,9 @@ async def run_yt_dlp(job_id:str, url:str, audio_only:bool):
         out = str(DOWNLOAD_DIR / "%(title).80s-%(id)s.%(ext)s")
         cmd = ["yt-dlp","-o",out,"--restrict-filenames","--newline","--no-warnings",url]
         cmd += ["-x","--audio-format","mp3","--audio-quality","0"] if audio_only else ["-f","bv*+ba/b"]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=str(DOWNLOAD_DIR))
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=str(DOWNLOAD_DIR)
+        )
         assert proc.stdout
         async for raw in proc.stdout:
             line = raw.decode(errors="ignore").strip()
@@ -111,28 +118,35 @@ async def run_yt_dlp(job_id:str, url:str, audio_only:bool):
                 JOBS[job_id]["title"]=line.split("Destination:",1)[1].strip()
             JOBS[job_id]["last"]=line
         rc = await proc.wait()
-        if rc != 0: JOBS[job_id].update(status="error", error=JOBS[job_id].get("last","Download failed.")); return
+        if rc != 0:
+            JOBS[job_id].update(status="error", error=JOBS[job_id].get("last","Download failed.")); return
         f = latest_file(DOWNLOAD_DIR)
-        if not f: JOBS[job_id].update(status="error", error="No file produced."); return
+        if not f:
+            JOBS[job_id].update(status="error", error="No file produced."); return
         JOBS[job_id].update(status="done", file=f.name, progress="100.0%")
     except Exception as e:
         JOBS[job_id].update(status="error", error=str(e))
 
 @app.get("/", response_class=HTMLResponse)
-async def home(request: Request): return templates.TemplateResponse("index.html", {"request": request})
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/healthz")
-async def health(): return JSONResponse({"ok": True})
+async def health():
+    return JSONResponse({"ok": True})
 
 @app.post("/api/download")
 async def api_download(background_tasks: BackgroundTasks, url: str = Form(...), audio_only: bool = Form(False)):
-    if not url.startswith(("http://","https://")): raise HTTPException(400, "Invalid URL")
-    jid = str(uuid.uuid4()); JOBS[jid]={"status":"queued","file":None,"error":None,"progress":"0%","url":url,"audio_only":audio_only,"title":None}
-    background_tasks.add_task(run_yt_dlp, jid, url, audio_only); return JSONResponse({"job_id": jid})
+    if not url.startswith(("http://","https://")):
+        raise HTTPException(400, "Invalid URL")
+    jid = str(uuid.uuid4())
+    JOBS[jid]={"status":"queued","file":None,"error":None,"progress":"0%","url":url,"audio_only":audio_only,"title":None}
+    background_tasks.add_task(run_yt_dlp, jid, url, audio_only)
+    return JSONResponse({"job_id": jid})
 
 @app.get("/api/status/{jid}")
 async def api_status(jid:str):
-    d = JOBS.get(jid); 
+    d = JOBS.get(jid)
     if not d: raise HTTPException(404, "Job not found.")
     return JSONResponse(d)
 
@@ -142,11 +156,16 @@ async def api_stream(jid:str):
     async def gen():
         last=None
         while True:
-            st=JOBS.get(jid); if not st: break
+            st = JOBS.get(jid)
+            if not st:
+                break
             payload={k:st.get(k) for k in("status","progress","file","error","title")}
             s=json.dumps(payload, ensure_ascii=False)
-            if payload!=last: yield f"data: {s}\n\n"; last=payload
-            if st.get("status") in("done","error"): break
+            if payload!=last:
+                yield f"data: {s}\n\n"
+                last=payload
+            if st.get("status") in("done","error"):
+                break
             await asyncio.sleep(1.0)
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -160,15 +179,14 @@ async def history():
 
 @app.get("/d/{filename}")
 async def download_file(filename:str):
-    p=DOWNLOAD_DIR/filename
+    p = DOWNLOAD_DIR / filename
     if not p.exists(): raise HTTPException(404,"File not found.")
     return FileResponse(str(p), filename=filename)
 PY
 
-  # New responsive UI/UX
+  # New responsive UI/UX (mobile-first)
   cat > "${APP_DIR}/backend/templates/index.html" <<'HTML'
-<!doctype html>
-<html lang="en"><head>
+<!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
 <title>Social Video Downloader</title>
 <style>
@@ -180,7 +198,7 @@ h1{font-size:26px;margin:0}.muted{color:var(--muted);font-size:14px}
 .grid{display:grid;grid-template-columns:1fr;gap:16px}@media(min-width:900px){.grid{grid-template-columns:2fr 1fr}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px}
 label{display:block;font-weight:600;margin:0 0 8px}
-input[type="text"]{width:100%;padding:14px 12px;border:1px solid #334155;border-radius:12px;background:var(--bg);color:var(--text);outline:none}
+input[type="text"]{width:100%;padding:14px 12px;border:1px solid #334155;border-radius:12px;background:var(--bg);color:var(--text)}
 .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:10px}
 .btn{padding:12px 16px;background:var(--brand);color:#fff;border:0;border-radius:12px;font-weight:600;cursor:pointer}
 .btn:disabled{opacity:.6;cursor:not-allowed}.status{margin-top:12px;padding:12px;background:var(--bg);border:1px dashed #334155;border-radius:12px;min-height:44px;white-space:pre-wrap}
@@ -192,7 +210,7 @@ a{color:#93c5fd;text-decoration:none}a:hover{text-decoration:underline}.hint{fon
 </style></head>
 <body>
 <div class="wrap">
-<header><div class="logo"></div><div><h1>Social Video Downloader</h1><div class="muted">Paste a public link. Watch live progress. MP3 optional.</div></div></header>
+<header><div class="logo"></div><div><h1>Social Video Downloader</h1><div class="muted">Paste a public link. Live progress. Optional MP3.</div></div></header>
 <div class="chips"><div class="chip">YouTube</div><div class="chip">TikTok</div><div class="chip">Facebook</div><div class="chip">Instagram</div><div class="chip">X/Twitter</div></div>
 <div class="grid">
   <div class="card">
@@ -200,7 +218,7 @@ a{color:#93c5fd;text-decoration:none}a:hover{text-decoration:underline}.hint{fon
       <label for="url">Video URL</label>
       <input id="url" name="url" type="text" inputmode="url" placeholder="https://..." required/>
       <div class="row"><label><input type="checkbox" id="audio_only" name="audio_only"/> MP3 only</label><button class="btn" id="go" type="submit">Download</button></div>
-      <div class="hint">Only download content you have rights to. Private links may require cookies.</div>
+      <div class="hint">Only download content you’re allowed to. Private links may require cookies.</div>
     </form>
     <div id="out" class="status" style="display:none;"></div>
     <div class="bar" aria-hidden="true"><i id="p"></i></div>
@@ -221,8 +239,6 @@ else if(data.status==='error'){p.className='err';es.close();go.disabled=false}}c
 </script>
 </body></html>
 HTML
-
-  ok "App files ready."
 }
 
 write_compose(){
@@ -247,34 +263,38 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
-    cap_drop: [ "ALL" ]
+    cap_drop: ["ALL"]
 COMPOSE
 }
 
 build_and_run(){
   ok "Building image..."
   docker compose -f "${APP_DIR}/docker-compose.yml" build --pull || {
-    warn "Build failed once. Retrying without cache..."
+    warn "Build failed once — retrying without cache..."
     DOCKER_BUILDKIT=0 docker compose -f "${APP_DIR}/docker-compose.yml" build --no-cache --pull
   }
   ok "Starting container..."
   docker compose -f "${APP_DIR}/docker-compose.yml" up -d
-  ok "Checking app health..."
-  for i in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" >/dev/null 2>&1; then ok "App healthy."; return 0; fi
+
+  ok "Waiting for app health..."
+  for i in $(seq 1 40); do
+    if curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" >/dev/null 2>&1; then
+      ok "App is healthy."; return 0
+    fi
     sleep 2
   done
-  warn "Health check not confirmed yet. Check logs:\n  docker compose -f ${APP_DIR}/docker-compose.yml logs -f"
+  warn "App health not confirmed. Logs:"
+  docker compose -f "${APP_DIR}/docker-compose.yml" logs --tail=120 || true
 }
 
 open_firewall(){
-  if command -v ufw >/dev/null 2>&1; then
+  if command -v ufw >/dev/null 2>/dev/null; then
     ufw status | grep -q inactive || { ufw allow 80/tcp || true; ufw allow 443/tcp || true; ufw allow ${HOST_PORT}/tcp || true; }
   fi
 }
 
 make_service(){
-  ok "Adding systemd unit..."
+  ok "Creating systemd unit..."
   cat > "/etc/systemd/system/${SERVICE}.service" <<UNIT
 [Unit]
 Description=Social Video Downloader (Docker Compose)
@@ -298,9 +318,12 @@ UNIT
 }
 
 setup_nginx(){
+  ok "Installing Nginx + reverse proxy..."
   apt-get update -y
   apt-get install -y nginx
-  # default site on port 80 proxying to the app (works even without a domain)
+  # Remove distro defaults to avoid duplicate default_server
+  rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/000-default || true
+
   tee /etc/nginx/sites-available/social_downloader_default >/dev/null <<NGINX
 server {
     listen 80 default_server;
@@ -319,14 +342,13 @@ server {
     }
 }
 NGINX
-  ln -sf /etc/nginx/sites-available/social_downloader_default /etc/nginx/sites-enabled/000-default
+  ln -sf /etc/nginx/sites-available/social_downloader_default /etc/nginx/sites-enabled/000-social
   nginx -t && systemctl reload nginx
 }
 
 setup_https(){
   [[ -z "$DOMAIN" || -z "$EMAIL" ]] && { warn "DOMAIN/EMAIL not set — skipping HTTPS."; return; }
   apt-get install -y certbot python3-certbot-nginx
-  # dedicated vhost for the domain, HTTP first
   tee /etc/nginx/sites-available/${DOMAIN} >/dev/null <<NGINX
 server {
     listen 80;
@@ -348,15 +370,14 @@ server {
 NGINX
   ln -sf /etc/nginx/sites-available/${DOMAIN} /etc/nginx/sites-enabled/${DOMAIN}
   nginx -t && systemctl reload nginx
-  # issue cert and enable redirect
-  certbot --nginx -d "${DOMAIN}" --redirect -m "${EMAIL}" --agree-tos -n || warn "Certbot failed; check DNS A record and retry."
+  certbot --nginx -d "${DOMAIN}" --redirect -m "${EMAIL}" --agree-tos -n || warn "Certbot failed; verify DNS A → this server, then retry."
 }
 
 summary(){
   echo
   ok "All set."
   local ip="$(hostname -I | awk '{print $1}')"
-  echo "Open:   http://${ip}/   (Nginx reverse proxy)"
+  echo "Open:   http://${ip}/   (Nginx proxy)"
   echo "Local:  http://127.0.0.1:${HOST_PORT}/"
   [[ -n "$DOMAIN" ]] && echo "Domain: https://${DOMAIN}/"
   echo "Path:   ${APP_DIR}"
@@ -370,17 +391,18 @@ summary(){
 main(){
   need_root
   detect_os
-  install_docker
-  make_app
+  preclean
 
   if port_in_use "$WANTED_PORT"; then
-    warn "Port ${WANTED_PORT} busy, searching for a free one..."
+    warn "Port ${WANTED_PORT} busy — picking a free one..."
     HOST_PORT="$(find_free_port "$WANTED_PORT")" || { err "No free port near ${WANTED_PORT}."; exit 1; }
-    ok "Using port ${HOST_PORT}."
   else
     HOST_PORT="$WANTED_PORT"
   fi
+  ok "App will listen on host port ${HOST_PORT} (-> container 8080)."
 
+  install_docker
+  write_app
   write_compose "$HOST_PORT"
   build_and_run
   open_firewall
@@ -389,5 +411,4 @@ main(){
   setup_https
   summary
 }
-
 main "$@"
